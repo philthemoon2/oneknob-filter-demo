@@ -133,7 +133,7 @@ let knobValue=0,filterType=0,dsOn=false,dsAmount=0;
 const MAX_STAGES=4;
 let inputGain,outputGain;
 let lpFilters=[],hpFilters=[];
-let zohWorklet=null;
+let resampleLPFilters=[];
 
 // --- Knob SVG ---
 const knobSvg=document.getElementById('knobSvg');
@@ -250,80 +250,26 @@ function updateFilters(){
 }
 
 function updateResample(){
-  if(!zohWorklet)return;
+  if(resampleLPFilters.length===0)return;
   const t=audioCtx.currentTime;
   if(dsOn&&dsAmount>0.001){
-    // Edison-style: pure ZOH, range hostSR -> 1000 Hz, NO post-filtering
     const hostSR=audioCtx.sampleRate;
     const targetSR=hostSR*Math.pow(1000/hostSR,dsAmount);
-    const phaseInc=targetSR/hostSR;
-    zohWorklet.parameters.get('phaseInc').setTargetAtTime(phaseInc,t,0.016);
-    zohWorklet.parameters.get('active').setTargetAtTime(1,t,0.005);
+    const cutoff=Math.max(20,Math.min(targetSR*0.5,hostSR*0.45));
+    for(const f of resampleLPFilters){f.frequency.setTargetAtTime(cutoff,t,0.016);f.Q.setTargetAtTime(0.707,t,0.016);}
   }else{
-    zohWorklet.parameters.get('active').setTargetAtTime(0,t,0.005);
+    for(const f of resampleLPFilters){f.frequency.setTargetAtTime(22000,t,0.016);f.Q.setTargetAtTime(0.707,t,0.016);}
   }
 }
 
-// --- AudioWorklet: Pure ZOH - NO filtering, NO interpolation ---
-const workletCode=`
-class ZOHProcessor extends AudioWorkletProcessor{
-  static get parameterDescriptors(){
-    return[
-      {name:'phaseInc',defaultValue:1.0,minValue:0.001,maxValue:1.0,automationRate:'k-rate'},
-      {name:'active',defaultValue:0,minValue:0,maxValue:1,automationRate:'k-rate'}
-    ];
-  }
-  constructor(){
-    super();
-    this.phase=0;
-    this.heldL=0;
-    this.heldR=0;
-  }
-  process(inputs,outputs,params){
-    const inp=inputs[0],out=outputs[0];
-    if(!inp||!inp[0]||!out||!out[0])return true;
-    const inL=inp[0], inR=inp.length>1?inp[1]:inp[0];
-    const outL=out[0], outR=out.length>1?out[1]:out[0];
-    const act=params.active[0];
-    if(act<0.5){
-      // Bypass: straight passthrough
-      for(let i=0;i<outL.length;i++){outL[i]=inL[i];outR[i]=inR[i];}
-    }else{
-      // Pure Zero-Order Hold: grab sample, hold it, repeat
-      // NO interpolation, NO anti-aliasing, NO smoothing
-      // This creates the raw staircase waveform = Edison resample sound
-      const inc=params.phaseInc[0];
-      for(let i=0;i<outL.length;i++){
-        this.phase+=inc;
-        if(this.phase>=1.0){
-          this.phase-=1.0;
-          // Grab new sample from input - this is the only moment we read
-          this.heldL=inL[i];
-          this.heldR=inR[i];
-        }
-        // Output the HELD sample (staircase pattern)
-        outL[i]=this.heldL;
-        outR[i]=this.heldR;
-      }
-    }
-    return true;
-  }
-}
-registerProcessor('zoh-processor',ZOHProcessor);
-`;
 
-// --- INIT: fixed chain, no post-LP filters ---
+// --- INIT: fixed chain with brickwall resample LP ---
 async function initAudio(){
   audioCtx=new(window.AudioContext||window.webkitAudioContext)();
   const raw=atob(AUDIO_B64);
   const buf=new Uint8Array(raw.length);
   for(let i=0;i<raw.length;i++)buf[i]=raw.charCodeAt(i);
   audioBuffer=await audioCtx.decodeAudioData(buf.buffer);
-  // Register worklet
-  const blob=new Blob([workletCode],{type:'application/javascript'});
-  const url=URL.createObjectURL(blob);
-  await audioCtx.audioWorklet.addModule(url);
-  URL.revokeObjectURL(url);
   // Create nodes
   inputGain=audioCtx.createGain();
   outputGain=audioCtx.createGain();
@@ -334,11 +280,10 @@ async function initAudio(){
   for(let i=0;i<MAX_STAGES;i++){
     const f=audioCtx.createBiquadFilter();f.type='highpass';f.frequency.value=5;f.Q.value=0.707;hpFilters.push(f);
   }
-  // ZOH worklet - pure resample, NO post-filter
-  zohWorklet=new AudioWorkletNode(audioCtx,'zoh-processor',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});
-  // FIXED CHAIN: input -> LP0-3 -> HP0-3 -> ZOH -> output
-  // NO post-LP filters! Raw staircase output = Edison resample sound
-  let chain=[inputGain,...lpFilters,...hpFilters,zohWorklet,outputGain];
+  // Resample LP filters - 4x cascaded biquad = 48dB/oct brickwall
+  for(let i=0;i<4;i++){const f=audioCtx.createBiquadFilter();f.type='lowpass';f.frequency.value=22000;f.Q.value=0.707;resampleLPFilters.push(f);}
+  // FIXED CHAIN: input -> LP0-3 -> HP0-3 -> ResampleLP0-3 -> output
+  let chain=[inputGain,...lpFilters,...hpFilters,...resampleLPFilters,outputGain];
   for(let i=0;i<chain.length-1;i++)chain[i].connect(chain[i+1]);
   outputGain.connect(audioCtx.destination);
   updateFilters();

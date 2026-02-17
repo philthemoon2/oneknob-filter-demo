@@ -146,7 +146,7 @@ let knobValue=0,filterType=0,dsOn=false,dsAmount=0;
 const MAX_STAGES=4;
 let inputGain,outputGain;
 let lpFilters=[],hpFilters=[];
-let resampleLPFilters=[];
+let firWorklet=null;
 
 // --- Knob SVG ---
 const knobSvg=document.getElementById('knobSvg');
@@ -263,20 +263,130 @@ function updateFilters(){
 }
 
 function updateResample(){
-  if(resampleLPFilters.length===0)return;
+  if(!firWorklet)return;
   const t=audioCtx.currentTime;
   if(dsOn&&dsAmount>0.001){
     const hostSR=audioCtx.sampleRate;
     const targetSR=hostSR*Math.pow(1000/hostSR,dsAmount);
-    const cutoff=Math.max(20,Math.min(targetSR*0.5,hostSR*0.45));
-    for(const f of resampleLPFilters){f.frequency.setTargetAtTime(cutoff,t,0.016);f.Q.setTargetAtTime(0.707,t,0.016);}
+    const ratio=targetSR/hostSR;
+    const cutoffNorm=targetSR/(2*hostSR);
+    firWorklet.port.postMessage({type:'updateKernel',cutoffNorm,ratio});
+    firWorklet.parameters.get('active').setTargetAtTime(1,t,0.005);
   }else{
-    for(const f of resampleLPFilters){f.frequency.setTargetAtTime(22000,t,0.016);f.Q.setTargetAtTime(0.707,t,0.016);}
+    firWorklet.parameters.get('active').setTargetAtTime(0,t,0.005);
   }
 }
 
 
-// --- INIT: fixed chain with brickwall resample LP ---
+// --- AudioWorklet: FIR Polyphase Resampler (Windowed-Sinc) ---
+// Full Decimation + Sinc Interpolation pipeline matching the JUCE plugin
+const firWorkletCode=`
+const FIR_TAPS=128;        // Anti-aliasing FIR filter length
+const SINC_POINTS=32;      // Reconstruction sinc kernel points
+const DECIM_BUF=512;        // Decimated samples ring buffer
+const PI=Math.PI;
+
+class FIRResamplerProcessor extends AudioWorkletProcessor{
+  static get parameterDescriptors(){
+    return[{name:'active',defaultValue:0,minValue:0,maxValue:1,automationRate:'k-rate'}];
+  }
+  constructor(){
+    super();
+    // FIR kernel + delay lines
+    this.kernel=new Float32Array(FIR_TAPS);
+    this.lineL=new Float32Array(FIR_TAPS);
+    this.lineR=new Float32Array(FIR_TAPS);
+    this.firPos=0;
+    // Decimated sample buffers
+    this.decL=new Float32Array(DECIM_BUF);
+    this.decR=new Float32Array(DECIM_BUF);
+    this.decPos=0;
+    // Phase accumulators
+    this.decimPhase=0;
+    this.ratio=1;
+    this.lastCutoff=-1;
+    // Listen for kernel updates from main thread
+    this.port.onmessage=(e)=>{
+      if(e.data.type==='updateKernel'){
+        this.ratio=e.data.ratio;
+        if(Math.abs(e.data.cutoffNorm-this.lastCutoff)>0.0005){
+          this.buildKernel(e.data.cutoffNorm);
+          this.lastCutoff=e.data.cutoffNorm;
+        }
+      }
+    };
+  }
+  // Build Blackman-Harris windowed sinc kernel
+  buildKernel(fc){
+    const M=(FIR_TAPS-1)/2;
+    let sum=0;
+    for(let n=0;n<FIR_TAPS;n++){
+      const x=n-M;
+      let h;
+      if(Math.abs(x)<1e-6) h=2*fc;
+      else h=Math.sin(2*PI*fc*x)/(PI*x);
+      const wn=n/(FIR_TAPS-1);
+      const w=0.35875-0.48829*Math.cos(2*PI*wn)+0.14128*Math.cos(4*PI*wn)-0.01168*Math.cos(6*PI*wn);
+      this.kernel[n]=h*w;
+      sum+=this.kernel[n];
+    }
+    if(Math.abs(sum)>1e-6)
+      for(let n=0;n<FIR_TAPS;n++) this.kernel[n]/=sum;
+  }
+  process(inputs,outputs,params){
+    const inp=inputs[0],out=outputs[0];
+    if(!inp||!inp[0]||!out||!out[0])return true;
+    const inL=inp[0],inR=inp.length>1?inp[1]:inp[0];
+    const outL=out[0],outR=out.length>1?out[1]:out[0];
+    const act=params.active[0];
+    if(act<0.5){
+      for(let i=0;i<outL.length;i++){outL[i]=inL[i];outR[i]=inR[i];}
+      return true;
+    }
+    const ratio=this.ratio;
+    const halfSinc=SINC_POINTS/2;
+    for(let i=0;i<inL.length;i++){
+      // Stage 1: Push into FIR delay line
+      this.lineL[this.firPos]=inL[i];
+      this.lineR[this.firPos]=inR[i];
+      // Stage 2: Decimation
+      this.decimPhase+=ratio;
+      while(this.decimPhase>=1.0){
+        this.decimPhase-=1.0;
+        let sL=0,sR=0;
+        for(let t=0;t<FIR_TAPS;t++){
+          const idx=(this.firPos-t+FIR_TAPS)%FIR_TAPS;
+          sL+=this.lineL[idx]*this.kernel[t];
+          sR+=this.lineR[idx]*this.kernel[t];
+        }
+        this.decL[this.decPos]=sL;
+        this.decR[this.decPos]=sR;
+        this.decPos=(this.decPos+1)%DECIM_BUF;
+      }
+      this.firPos=(this.firPos+1)%FIR_TAPS;
+      // Stage 3: Windowed-sinc interpolation
+      const frac=this.decimPhase;
+      const rc=(this.decPos-1-halfSinc+DECIM_BUF)%DECIM_BUF;
+      let oL=0,oR=0;
+      for(let k=-halfSinc;k<halfSinc;k++){
+        const x=frac-k;
+        const s=Math.abs(x)<1e-6?1.0:Math.sin(PI*x)/(PI*x);
+        const wp=(k+halfSinc)/(SINC_POINTS-1);
+        const w=0.5-0.5*Math.cos(2*PI*wp);
+        const idx=(rc+k+DECIM_BUF)%DECIM_BUF;
+        oL+=this.decL[idx]*s*w;
+        oR+=this.decR[idx]*s*w;
+      }
+      outL[i]=oL;
+      outR[i]=oR;
+    }
+    return true;
+  }
+}
+registerProcessor('fir-resampler',FIRResamplerProcessor);
+`;
+
+// --- INIT: Polyphase FIR Resampler ---
 async function initAudio(){
   audioCtx=new(window.AudioContext||window.webkitAudioContext)();
   const raw=atob(AUDIO_B64);
@@ -293,10 +403,14 @@ async function initAudio(){
   for(let i=0;i<MAX_STAGES;i++){
     const f=audioCtx.createBiquadFilter();f.type='highpass';f.frequency.value=5;f.Q.value=0.707;hpFilters.push(f);
   }
-  // Resample LP filters - 4x cascaded biquad = 48dB/oct brickwall
-  for(let i=0;i<4;i++){const f=audioCtx.createBiquadFilter();f.type='lowpass';f.frequency.value=22000;f.Q.value=0.707;resampleLPFilters.push(f);}
-  // FIXED CHAIN: input -> LP0-3 -> HP0-3 -> ResampleLP0-3 -> output
-  let chain=[inputGain,...lpFilters,...hpFilters,...resampleLPFilters,outputGain];
+  // FIR Resampler AudioWorklet (Windowed-Sinc Decimation + Sinc Interpolation)
+  const firBlob=new Blob([firWorkletCode],{type:'application/javascript'});
+  const firUrl=URL.createObjectURL(firBlob);
+  await audioCtx.audioWorklet.addModule(firUrl);
+  URL.revokeObjectURL(firUrl);
+  firWorklet=new AudioWorkletNode(audioCtx,'fir-resampler',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});
+  // FIXED CHAIN: input -> LP0-3 -> HP0-3 -> FIR Resampler -> output
+  let chain=[inputGain,...lpFilters,...hpFilters,firWorklet,outputGain];
   for(let i=0;i<chain.length-1;i++)chain[i].connect(chain[i+1]);
   outputGain.connect(audioCtx.destination);
   updateFilters();
